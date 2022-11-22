@@ -371,6 +371,13 @@ static inline unsigned long ukarch_read_sp(void)
 	return sp;
 }
 
+#if defined(__aarch64__)
+static inline void ukarch_thread_fence_acq(void)
+{
+	dmb();
+}
+#endif
+
 static inline void ukarch_spinwait(void)
 {
 	/* Intelligent busy wait not supported on arm64. */
