@@ -201,10 +201,10 @@ static void pvcalls_map_init_evp(struct sock_mapping *map)
 
 static int xs_read_backend_id(const char *nodename, domid_t *domid)
 {
-	char path[strlen(nodename) + sizeof("/backend-id") + 1];
+	char path[strlen(nodename) + sizeof("/backend-id")];
 	int value, rc;
 
-	snprintf(path, sizeof(path) - 1, "%s/backend-id", nodename);
+	snprintf(path, sizeof(path), "%s/backend-id", nodename);
 
 	rc = xs_read_integer(XBT_NIL, path, &value);
 	if (!rc)
@@ -228,7 +228,7 @@ static int xs_read_int_value(xenbus_transaction_t xbt, const char *nodename,
 {
 	char fpath[strlen(nodename) + strlen(path) + 2];
 
-	snprintf(fpath, sizeof(fpath) - 1, "%s/%s", nodename, path);
+	snprintf(fpath, sizeof(fpath), "%s/%s", nodename, path);
 
 	return xs_read_integer(xbt, fpath, (int *)value);
 }
@@ -718,13 +718,44 @@ int pvcalls_front_sendmsg(struct posix_socket_file *sock,
 	return tot_sent;
 }
 
+static int copy_to_iov(struct msghdr *msg, unsigned char *src,
+			  int src_len, int *iov_off)
+{
+	int i, bytes_written = 0;
+	int off = 0, sw, cpy_len;
+
+	for (i = 0; i < msg->msg_iovlen; i++)
+	{
+		if (*iov_off > off + msg->msg_iov[i].iov_len) {
+			off += msg->msg_iov[i].iov_len;
+			continue;
+		}
+
+		sw = (*iov_off > off) ? *iov_off - off : 0;
+
+		cpy_len = (sw > 0) ? msg->msg_iov[i].iov_len - sw : msg->msg_iov[i].iov_len;
+		cpy_len = (cpy_len > src_len - bytes_written) ? src_len - bytes_written : cpy_len;
+
+		memcpy(msg->msg_iov[i].iov_base + sw, src + bytes_written, cpy_len);
+		bytes_written += cpy_len;
+		off += cpy_len;
+		*iov_off += cpy_len;
+
+		if (bytes_written == src_len)
+			break;
+	}
+
+	return bytes_written;
+}
+
 static int __read_ring(struct pvcalls_data_intf *intf,
-		       struct pvcalls_data *data,
-		       void *mem, ssize_t len, int flags)
+		      struct pvcalls_data *data, struct msghdr *msg,
+		      size_t len, int flags)
 {
 	RING_IDX cons, prod, size, masked_prod, masked_cons;
 	RING_IDX array_size = XEN_FLEX_RING_SIZE(PVCALLS_RING_ORDER);
 	int32_t error;
+	int iov_off = 0;
 
 	cons = intf->in_cons;
 	prod = intf->in_prod;
@@ -743,21 +774,21 @@ static int __read_ring(struct pvcalls_data_intf *intf,
 		len = size;
 
 	if (masked_prod > masked_cons) {
-		memcpy(mem, data->in + masked_cons, len);
+		len = copy_to_iov(msg, data->in + masked_cons, len, &iov_off);
 	} else {
 		if (len > (array_size - masked_cons)) {
-			int ret;
-
-			memcpy(mem, data->in + masked_cons,
-				     array_size - masked_cons);
-			ret = array_size - masked_cons;
-			memcpy(mem, data->in, len - ret);
-			len += ret;
+			int ret = copy_to_iov(msg, data->in + masked_cons,
+								  array_size - masked_cons, &iov_off);
+			if (ret != array_size - masked_cons) {
+				len = ret;
+				goto out;
+			}
+			len = ret + copy_to_iov(msg, data->in, len - ret, &iov_off);
 		} else {
-			memcpy(mem, data->in + masked_cons, len);
+			len = copy_to_iov(msg, data->in + masked_cons, len, &iov_off);
 		}
 	}
-
+out:
 	/* read data from the ring before increasbing the index */
 	mb();
 	if (!(flags & MSG_PEEK))
@@ -769,12 +800,8 @@ static int __read_ring(struct pvcalls_data_intf *intf,
 int pvcalls_front_recvmsg(struct posix_socket_file *sock,
 		struct msghdr *msg, size_t len, int flags)
 {
-	int i;
+	int ret;
 	struct sock_mapping *map;
-	ssize_t buflen = 0;
-
-	if (len < msg->msg_iovlen)
-		return -EOPNOTSUPP;
 
 	if (flags & (MSG_CMSG_CLOEXEC | MSG_ERRQUEUE | MSG_OOB | MSG_TRUNC))
 		return -EOPNOTSUPP;
@@ -792,35 +819,19 @@ int pvcalls_front_recvmsg(struct posix_socket_file *sock,
 					 pvcalls_front_read_todo(map));
 	}
 
-	for (i = 0; i < msg->msg_iovlen; i++) {
-		ssize_t recvd_local = __read_ring(map->active.ring,
-				&map->active.data, msg->msg_iov[i].iov_base,
-				msg->msg_iov[i].iov_len, flags);
-		if (recvd_local > 0)
-			buflen += recvd_local;
-		if ((recvd_local < 0)
-		     || (recvd_local < (int)msg->msg_iov[i].iov_len)
-		     || (flags & MSG_PEEK)) {
-			/* returned prematurely (or peeking, which might
-			 * actually be limitated to the first iov)
-			 */
-			if (buflen <= 0) {
-				/* nothing received at all, propagate the error
-				 */
-				buflen = recvd_local;
-			}
-			break;
-		}
-	}
+	ret = __read_ring(map->active.ring, &map->active.data, msg,
+				len, flags);
 
-	if (buflen > 0)
+	if (ret > 0)
 		notify_remote_via_evtchn(map->active.evtchn);
-	if (buflen == 0)
-		buflen = (flags & MSG_DONTWAIT) ? -EAGAIN : 0;
+	if (ret == 0)
+		ret = (flags & MSG_DONTWAIT) ? -EAGAIN : 0;
+	if (ret == -ENOTCONN)
+		ret = 0;
 
 	uk_mutex_unlock(&map->active.in_mutex);
 	pvcalls_exit_sock(sock);
-	return buflen;
+	return ret;
 }
 
 int pvcalls_front_bind(struct posix_socket_file *sock,
@@ -875,7 +886,7 @@ int pvcalls_front_bind(struct posix_socket_file *sock,
 
 	map->passive.status = PVCALLS_STATUS_BIND;
 	pvcalls_exit_sock(sock);
-	return 0;
+	return ret;
 }
 int pvcalls_front_listen(struct posix_socket_file *sock, int backlog)
 {
@@ -1359,7 +1370,7 @@ static int pvcalls_wait_be_connect(struct uk_pvdev *pvdev)
 	XenbusState be_state;
 	int rc;
 
-	sprintf(be_state_path, "%s/state", xendev->otherend);
+	snprintf(be_state_path, sizeof(be_state_path), "%s/state", xendev->otherend);
 
 	rc = be_watch_start(xendev, be_state_path);
 	if (rc)
@@ -1395,8 +1406,7 @@ static int pvcalls_front_probe(struct uk_pvdev *p)
 	UK_ASSERT(p != NULL);
 
 	xendev = p->xendev;
-	UK_ASSERT(xendev != NULL);
-	UK_ASSERT(xendev->nodename != NULL);
+	UK_ASSERT(xendev != NULL && xendev->nodename != NULL);
 
 	ret = xs_read_backend_id(xendev->nodename, &xendev->otherend_id);
 	if (ret)
