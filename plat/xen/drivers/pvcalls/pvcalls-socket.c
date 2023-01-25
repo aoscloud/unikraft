@@ -70,17 +70,28 @@ static int pvcalls_socket_listen(struct posix_socket_file *sock,
 	return pvcalls_front_listen(sock, backlog);
 }
 
+static inline ssize_t get_len(struct msghdr *msg)
+{
+	int i;
+	ssize_t res = 0;
+
+	for (i = 0; i < msg->msg_iovlen; i++)
+		res += msg->msg_iov[i].iov_len;
+
+    return res;
+}
+
 static ssize_t pvcalls_socket_sendmsg(struct posix_socket_file *sock,
 			   const struct msghdr *msg,
 			   int flags __unused)
 {
-	return pvcalls_front_sendmsg(sock, msg, msg->msg_iovlen);
+	return pvcalls_front_sendmsg(sock, msg, get_len(msg));
 }
 
 static ssize_t pvcalls_socket_recvmsg(struct posix_socket_file *sock,
 			   struct msghdr *msg, int flags)
 {
-	return pvcalls_front_recvmsg(sock, msg, msg->msg_iovlen, flags);
+	return pvcalls_front_recvmsg(sock, msg, get_len(msg), flags);
 }
 
 static ssize_t pvcalls_socket_read(struct posix_socket_file *sock,
@@ -93,7 +104,7 @@ static ssize_t pvcalls_socket_read(struct posix_socket_file *sock,
 	msg.msg_iov = iov;
 	msg.msg_iovlen = iovcnt;
 
-	return pvcalls_front_recvmsg(sock, &msg, iovcnt, 0);
+	return pvcalls_front_recvmsg(sock, &msg, get_len(&msg), 0);
 }
 
 static ssize_t pvcalls_socket_write(struct posix_socket_file *sock,
@@ -107,7 +118,7 @@ static ssize_t pvcalls_socket_write(struct posix_socket_file *sock,
 	msg.msg_iovlen = iovcnt;
 	msg.msg_flags = 0;
 
-	return pvcalls_front_sendmsg(sock, &msg, iovcnt);
+	return pvcalls_front_sendmsg(sock, &msg, get_len(&msg));
 }
 
 static int pvcalls_socket_close(struct posix_socket_file *sock)
